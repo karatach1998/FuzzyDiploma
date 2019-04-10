@@ -41,7 +41,61 @@ PyMODINIT_FUNC PyInit_fuzzy_ext(void)
 
 static PyObject* predict_cpu_wrapper(PyObject* dummy, PyObject* args)
 {
-    return NULL;
+    PyObject *fsets_obj;
+    PyArrayObject *a0_obj, *a_obj, *b_obj;
+
+    if (!PyArg_ParseTuple(args, "OOOO", &fsets_obj, &a0_obj, &a_obj, &b_obj)) {
+        return NULL;
+    }
+
+    Py_ssize_t fsets_len = PyList_Size(fsets_obj);
+    npy_intp* a0_dims = PyArray_DIMS(a0_obj);
+    npy_intp* a_dims = PyArray_DIMS(a_obj);
+    npy_intp* b_dims = PyArray_DIMS(b_obj);
+
+    unsigned N = a_dims[1];
+    unsigned n = fsets_len - 1;
+
+    unsigned i, j, offset;
+    unsigned fsets_ptr_buf_sz = 0;
+    unsigned fsets_lens[fsets_len], fsets_dims[fsets_len];
+
+    for (i = 0; i < fsets_len; ++i) {
+        PyArrayObject* fset_obj = (PyArrayObject*) PyList_GET_ITEM(fsets_obj, i);
+        npy_intp* fset_dims = PyArray_DIMS(fset_obj);
+        fsets_lens[i] = fset_dims[0];
+        fsets_ptr_buf_sz += fsets_dims[i] = fset_dims[1];
+    }
+
+    const float* fsets_ptr_buf[fsets_ptr_buf_sz];
+    const float** fsets_table[fsets_len];
+
+    offset = 0;
+    for (i = 0; i < fsets_len; ++i) {
+        PyArrayObject* fset_obj = (PyArrayObject*) PyList_GET_ITEM(fsets_obj, i);
+        fsets_table[i] = fsets_ptr_buf + offset;
+        for (j = 0; j < fsets_lens[i]; ++j) {
+            fsets_ptr_buf[offset + j] = PyArray_GETPTR1(fset_obj, j);
+        }
+        offset += fsets_lens[i];
+    }
+
+    const float* a0[n];
+    const unsigned char* a[n];
+    const unsigned char* b = PyArray_DATA(b_obj);
+    float b0[fsets_dims[n]];
+
+    for (i = 0; i < n; ++i) {
+        a0[i] = PyArray_GETPTR1(a0_obj, i);
+        a[i] = PyArray_GETPTR1(a_obj, i);
+    }
+
+    predict_cpu_asm_clang(fsets_table, fsets_lens, fsets_dims, a0, a, b, b0, N, n);
+
+    PyObject* b0_obj = PyArray_SimpleNew(1, (npy_intp[]){fsets_dims[n]}, NPY_FLOAT32);
+    memcpy(PyArray_DATA(b0_obj), b0, sizeof(float[fsets_dims[n]]));
+
+    return b0_obj;
 }
 
 static PyObject* predict_gpu_wrapper(PyObject* dummy, PyObject* args)

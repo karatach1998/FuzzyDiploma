@@ -12,16 +12,17 @@ except ImportError:
 
 PACKAGE_DIR = 'fuzzy'
 
-ext_module = Extension('fuzzy_ext', 
+ext_module = Extension('fuzzy_ext',
                        language='cuda',
                        include_dirs=[np.get_include()],
-                       sources=[join(PACKAGE_DIR, 'ext', file) for file in ['fuzzy_wrapper.c', 'fuzzy_cpu.c', 'fuzzy_gpu.cu']],
+                       sources=[join(PACKAGE_DIR, 'ext', file) for file in ['fuzzy_wrapper.c', 'fuzzy_cpu.c', 'fuzzy_cpu_asm.S', 'fuzzy_gpu.cu']],
                        extra_compile_args={
-                             'gcc': ['-O0'],
+                             'gcc': ['-O3'],
                              'nvcc': '-c -Xcompiler -fPIC,-g,-O0'.split()},
                        extra_link_args=['-lstdc++', '-L/usr/local/cuda/lib64', '-lcudart'])
 
 def customize_compiler_for_cuda(compiler):
+      compiler.src_extensions.append('.S')
       compiler.src_extensions.append('.cu')
       default_compiler_so = compiler.compiler_so
       super = compiler._compile
@@ -29,7 +30,7 @@ def customize_compiler_for_cuda(compiler):
       def _compile(self, src, ext, cc_args, extra_postargs, pp_opts):
             _, ext = splitext(src)
             if ext == '.cu':
-                  compiler.set_executable('compiler_so', 'nvcc')
+                  compiler.set_executable('compiler_so', '/usr/local/cuda-9.0/bin/nvcc')
                   postargs = extra_postargs['nvcc']
             else:
                   postargs = extra_postargs['gcc']
