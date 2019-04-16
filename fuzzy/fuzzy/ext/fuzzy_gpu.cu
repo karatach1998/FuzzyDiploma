@@ -77,7 +77,7 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
 #pragma unroll
             for (ti = 0; ti < T_NUM; ++ti) {
                 float impl = IMPL((float)ti / (T_NUM - 1), b[tid]);
-                float min = MIN(ftp[ti], impl);
+                float min = fminf(ftp[ti], impl);
                 if (min > b0[tid]) b0[tid] = min;
             }
             b0_buf[(k * n + attr_index) * buf_entry_sz + tid] = b0[tid];
