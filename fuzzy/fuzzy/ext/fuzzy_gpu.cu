@@ -33,23 +33,27 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
 {
     unsigned i, j, k;
     unsigned buf_entry_sz = WARP_MULTIPLE(b_n);
+    unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_NUM, b_n));
+    unsigned executor_per_block = MAX(1, blockDim.x / warp_multiple_dim);
+    unsigned executor_index = threadIdx.x / warp_multiple_dim;
+    unsigned tid = threadIdx.x % warp_multiple_dim;
 
     extern __shared__ float cache[];
 
-    float* ftp = cache;
-    float* b0 = ftp + WARP_MULTIPLE(T_NUM);
+    float* ftp = cache + executor_index * (T_NUM + b_n);
+    float* b0 = cache + executor_index * (T_NUM + b_n) + T_NUM;
 
-    unsigned ti = threadIdx.x;
+    unsigned ti = tid;
     float t = (float) ti / (T_NUM - 1);
 
-    for (k = blockIdx.x; k < N; k += gridDim.x) {
+    for (k = blockIdx.x * executor_per_block + executor_index; k < N; k += gridDim.x * executor_per_block) {
         // NOTE(sergey): both ftp and b0 shared memory buffer's size is multiple of the warp size.
         // Underlying thought about warps organizaton in block of this kernel is
         // that some warps will be take off from execution by SM's warp scheduler
         // due to if condition. It guards from overhead when computing with unified block size
         // (maximum from ftp and b0 buffer sizes).
 
-        if (threadIdx.x < WARP_MULTIPLE(T_NUM)) {
+        if (tid < WARP_MULTIPLE(T_NUM)) {
             const float* __restrict__ a = a_fsets + a_indices[k] * a_n;
 
             ftp[ti] = 0.f;
@@ -66,17 +70,17 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
             }
         }
 
-        if (threadIdx.x < WARP_MULTIPLE(b_n)) {
+        if (tid < WARP_MULTIPLE(b_n)) {
             const float* __restrict__ b = b_fsets + b_indices[k] * b_n;
 
-            b0[threadIdx.x] = 0.f;
+            b0[tid] = 0.f;
 #pragma unroll
             for (ti = 0; ti < T_NUM; ++ti) {
-                float impl = IMPL((float)ti / (T_NUM - 1), b_fsets[threadIdx.x]);
+                float impl = IMPL((float)ti / (T_NUM - 1), b[tid]);
                 float min = MIN(ftp[ti], impl);
-                if (min > b0[threadIdx.x]) b0[threadIdx.x] = min;
+                if (min > b0[tid]) b0[tid] = min;
             }
-            b0_buf[(k * n + attr_index) * buf_entry_sz + threadIdx.x] = b0[threadIdx.x];
+            b0_buf[(k * n + attr_index) * buf_entry_sz + tid] = b0[tid];
         }
     }
 }
@@ -172,8 +176,11 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
 
     static cudaDeviceProp prop = get_props_for_current_device();
 
+    LOG_DEVICE_PROP(maxThreadsPerBlock);
+    LOG_DEVICE_PROP(maxThreadsPerMultiProcessor);
+
     unsigned i, j;
-    unsigned partial_buf_entry_sz = WARP_MULTIPLE(MAX(T_NUM, fsets_dims[n]));
+    unsigned partial_buf_entry_sz = WARP_MULTIPLE(fsets_dims[n]);
     unsigned fsets_buf_sz = 0;
     unsigned a0_buf_sz = 0;
 
@@ -243,9 +250,14 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
         a0_buf_offset += fsets_dims[i];
 
         {
-            unsigned blocks = prop.multiProcessorCount * 8;
-            unsigned threads = WARP_MULTIPLE(MAX(T_NUM, fsets_dims[n]));
-            unsigned shared_sz = sizeof(float[/* ftp */ WARP_MULTIPLE(T_NUM) + /* b0 */ WARP_MULTIPLE(fsets_dims[n])]);
+            unsigned min_blocks_per_sm = prop.maxThreadsPerMultiProcessor / prop.maxThreadsPerBlock;
+            unsigned blocks = prop.multiProcessorCount * min_blocks_per_sm;
+            // NOTE(sergey): To achieve better performance we probably need to perform computation for more than one rule inside one block.
+            // So we use several executors per block.
+            unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_NUM, fsets_dims[n]));
+            unsigned executor_per_block = prop.maxThreadsPerBlock / warp_multiple_dim;
+            unsigned threads = executor_per_block * warp_multiple_dim;
+            unsigned shared_sz = sizeof(float[executor_per_block][/* ftp */ WARP_MULTIPLE(T_NUM) + /* b0 */ WARP_MULTIPLE(fsets_dims[n])]);
             compute_kernel<<<blocks, threads, shared_sz, streams[i]>>>(fsets_buf_d_table[i], fsets_b_d, a0_buf_d_table[i], a_indices_d + i * N, b_indices_d, partial_buf_d,
                                                                        i, fsets_lens[i], fsets_dims[i], fsets_lens[n], fsets_dims[n], N, n);
             CU_HANDLE_ERROR(cudaPeekAtLastError());
