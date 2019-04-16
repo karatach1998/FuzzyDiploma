@@ -27,75 +27,57 @@ static void cuda_handle_error(cudaError_t e, const char* file, int line, const c
 }
 
 __global__
-void compute_ftp_kernel(const float* fsets, const float* a0, const unsigned char* a_indices, float* ftp_buf,
-                        unsigned attr_index, unsigned a_len, unsigned a_n, unsigned b_n, unsigned N, unsigned n)
+void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__ b_fsets, const float* __restrict__ a0,
+                         const unsigned char* a_indices, const unsigned char* b_indices, float* b0_buf,
+                         unsigned attr_index, unsigned a_len, unsigned a_n, unsigned b_len, unsigned b_n, unsigned N, unsigned n)
 {
     unsigned i, j, k;
-
-    unsigned ftp_buf_entry_sz = WARP_MULTIPLE(MAX(T_NUM, b_n));
-
-    // __shared__ float a_cache[a_len][a_n+1];
-    // __shared__ float a0_cache[a_n+1];
-    // __shared__ float ftp[T_NUM];
+    unsigned buf_entry_sz = WARP_MULTIPLE(b_n);
 
     extern __shared__ float cache[];
 
-    float* a_cache = cache;
-    float* a0_cache = a_cache + a_len * (a_n+1);
-    float* ftp = a0_cache + (a_n+1);
-
-    for (k = 0; k < a_len; ++k) {
-        for (i = threadIdx.x; i < a_n; i += blockDim.x) a_cache[k * (a_n+1) + i] = fsets[k * a_n + i];
-        if (threadIdx.x == 0) a_cache[k * (a_n+1) + a_n] = a_cache[k * (a_n+1) + a_n - 1];
-    }
-    for (i = threadIdx.x; i < a_n; i += blockDim.x) a0_cache[i] = a0[i];
-    if (threadIdx.x == 0) a0_cache[a_n] = a0_cache[a_n-1];
+    float* ftp = cache;
+    float* b0 = ftp + WARP_MULTIPLE(T_NUM);
 
     unsigned ti = threadIdx.x;
     float t = (float) ti / (T_NUM - 1);
 
     for (k = blockIdx.x; k < N; k += gridDim.x) {
-        float* a = a_cache + a_indices[k] * (a_n+1);
+        // NOTE(sergey): both ftp and b0 shared memory buffer's size is multiple of the warp size.
+        // Underlying thought about warps organizaton in block of this kernel is
+        // that some warps will be take off from execution by SM's warp scheduler
+        // due to if condition. It guards from overhead when computing with unified block size
+        // (maximum from ftp and b0 buffer sizes).
 
-        ftp[ti] = 0.f;
-        for (i = 0; i < a_n; ++i) {
-            float a1 = a[i];
-            float a2 = a[i + 1];
+        if (threadIdx.x < WARP_MULTIPLE(T_NUM)) {
+            const float* __restrict__ a = a_fsets + a_indices[k] * a_n;
 
-            if ((t - a1) * (a2 - t) >= 0) {
-                float y = a0_cache[i] + (t - a1) * (a0_cache[i+1] - a0_cache[i]) / (a2 - a1);
-                if (y > ftp[ti]) ftp[ti] = y;
+            ftp[ti] = 0.f;
+            for (i = 0; i < a_n - 1; ++i) {
+                float a1 = a[i];
+                float a2 = a[i + 1];
+
+                // NOTE(sergey): Experimentally was approved that performing arithmetic
+                // before condition check is more efficient that doing it in the true case.
+                // I guess it happens because condition check followed by assignment translates
+                // to appropriate PTX condition-move instruction.
+                float y = a0[i] + (t - a1) * (a0[i+1] - a0[i]) / (a2 - a1);
+                if ((t - a1) * (a2 - t) >= 0 && y > ftp[ti]) ftp[ti] = y;
             }
         }
-        ftp_buf[(k * n + attr_index) * ftp_buf_entry_sz + ti] = ftp[ti];
-    }
-}
 
-__global__
-void compute_b0_kernel(const float* __restrict__ fsets, const float* ftp_buf, const unsigned char* __restrict__ b_indices, float* b0_buf,
-                       unsigned attr_index, unsigned b_len, unsigned b_n, unsigned N, unsigned n)
-{
-    unsigned i, ti, k;
+        if (threadIdx.x < WARP_MULTIPLE(b_n)) {
+            const float* __restrict__ b = b_fsets + b_indices[k] * b_n;
 
-    unsigned buf_entry_sz = WARP_MULTIPLE(MAX(T_NUM, b_n));
-
-    extern __shared__ float cache[];
-
-    float* ftp_cache = cache;
-    float* b0 = ftp_cache + T_NUM;
-
-    for (k = 0; k < N; ++k) {
-        const float* __restrict__ b = fsets + b_indices[k] * b_n;
-
-        b0[threadIdx.x] = 0.f;
-        for (i = threadIdx.x; i < T_NUM; i += blockDim.x) ftp_cache[i] = ftp_buf[(k * n + attr_index) * buf_entry_sz + i];
+            b0[threadIdx.x] = 0.f;
 #pragma unroll
-        for (ti = 0; ti < T_NUM; ++ti) {
-            float impl = IMPL((float)ti / (T_NUM - 1), b[threadIdx.x]);
-            float min = MIN(ftp_cache[ti], impl);
-            if (min > b0[threadIdx.x]) b0[threadIdx.x] = min;
+            for (ti = 0; ti < T_NUM; ++ti) {
+                float impl = IMPL((float)ti / (T_NUM - 1), b_fsets[threadIdx.x]);
+                float min = MIN(ftp[ti], impl);
+                if (min > b0[threadIdx.x]) b0[threadIdx.x] = min;
+            }
+            b0_buf[(k * n + attr_index) * buf_entry_sz + threadIdx.x] = b0[threadIdx.x];
         }
-        b0_buf[(k * n + attr_index) * buf_entry_sz + threadIdx.x] = b0[threadIdx.x];
     }
 }
 
@@ -190,7 +172,7 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
 
     static cudaDeviceProp prop = get_props_for_current_device();
 
-    unsigned i, j, k;
+    unsigned i, j;
     unsigned partial_buf_entry_sz = WARP_MULTIPLE(MAX(T_NUM, fsets_dims[n]));
     unsigned fsets_buf_sz = 0;
     unsigned a0_buf_sz = 0;
@@ -262,21 +244,10 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
 
         {
             unsigned blocks = prop.multiProcessorCount * 8;
-            unsigned warp_multiple_dim = WARP_MULTIPLE(T_NUM);
-            unsigned threads = warp_multiple_dim;
-            unsigned shared_sz = sizeof(float[/* a_cache */ fsets_lens[i] * (fsets_dims[i]+1) + /* a0_cache */ (fsets_dims[i]+1) + /* ftp */ warp_multiple_dim]);
-            compute_ftp_kernel<<<blocks, threads, shared_sz, streams[i]>>>(fsets_buf_d_table[i], a0_buf_d_table[i], a_indices_d + i * N, partial_buf_d,
-                                                                           i, fsets_lens[i], fsets_dims[i], fsets_dims[n], N, n);
-            CU_HANDLE_ERROR(cudaPeekAtLastError());
-        }
-
-        {
-            unsigned blocks = prop.multiProcessorCount * 2;
-            unsigned warp_multiple_dim = WARP_MULTIPLE(fsets_dims[n]);
-            unsigned threads = warp_multiple_dim;
-            unsigned shared_sz = sizeof(float[/* ftp_cache */ T_NUM + /* b0 */ warp_multiple_dim]);
-            compute_b0_kernel<<<blocks, threads, shared_sz, streams[i]>>>(fsets_b_d, partial_buf_d, b_indices_d, partial_buf_d,
-                                                                          i, fsets_lens[n], fsets_dims[n], N, n);
+            unsigned threads = WARP_MULTIPLE(MAX(T_NUM, fsets_dims[n]));
+            unsigned shared_sz = sizeof(float[/* ftp */ WARP_MULTIPLE(T_NUM) + /* b0 */ WARP_MULTIPLE(fsets_dims[n])]);
+            compute_kernel<<<blocks, threads, shared_sz, streams[i]>>>(fsets_buf_d_table[i], fsets_b_d, a0_buf_d_table[i], a_indices_d + i * N, b_indices_d, partial_buf_d,
+                                                                       i, fsets_lens[i], fsets_dims[i], fsets_lens[n], fsets_dims[n], N, n);
             CU_HANDLE_ERROR(cudaPeekAtLastError());
         }
     }
