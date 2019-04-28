@@ -28,25 +28,26 @@ static void cuda_handle_error(cudaError_t e, const char* file, int line, const c
 
 __global__
 void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__ b_fsets, const float* __restrict__ a0,
-                         const unsigned char* a_indices, const unsigned char* b_indices, float* b0_buf,
-                         unsigned attr_index, unsigned a_len, unsigned a_n, unsigned b_len, unsigned b_n, unsigned N, unsigned n)
+                    const unsigned char* __restrict__ a_indices, const unsigned char* __restrict__ b_indices, float* b0_buf,
+                    unsigned attr_index, unsigned a_len, unsigned a_n, unsigned b_len, unsigned b_n, unsigned N, unsigned n)
 {
     unsigned i, j, k;
     unsigned buf_entry_sz = WARP_MULTIPLE(b_n);
     unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_NUM, b_n));
-    unsigned executor_per_block = MAX(1, blockDim.x / warp_multiple_dim);
+    unsigned executor_per_block = blockDim.x / warp_multiple_dim;
     unsigned executor_index = threadIdx.x / warp_multiple_dim;
     unsigned tid = threadIdx.x % warp_multiple_dim;
 
     extern __shared__ float cache[];
 
-    float* ftp = cache + executor_index * (T_NUM + b_n);
-    float* b0 = cache + executor_index * (T_NUM + b_n) + T_NUM;
-
+    float* ftp = cache + executor_index * (WARP_MULTIPLE(T_NUM) + WARP_MULTIPLE(b_n));
+    float* b0 = cache + executor_index * (WARP_MULTIPLE(T_NUM) + WARP_MULTIPLE(b_n)) + WARP_MULTIPLE(T_NUM);
+    
     unsigned ti = tid;
-    float t = (float) ti / (T_NUM - 1);
+    const float t = (float) ti / (T_NUM - 1);
 
     for (k = blockIdx.x * executor_per_block + executor_index; k < N; k += gridDim.x * executor_per_block) {
+
         // NOTE(sergey): both ftp and b0 shared memory buffer's size is multiple of the warp size.
         // Underlying thought about warps organizaton in block of this kernel is
         // that some warps will be take off from execution by SM's warp scheduler
@@ -55,6 +56,7 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
 
         if (tid < WARP_MULTIPLE(T_NUM)) {
             const float* __restrict__ a = a_fsets + a_indices[k] * a_n;
+            const unsigned ti = tid;
 
             ftp[ti] = 0.f;
             for (i = 0; i < a_n - 1; ++i) {
@@ -176,9 +178,6 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
 
     static cudaDeviceProp prop = get_props_for_current_device();
 
-    LOG_DEVICE_PROP(maxThreadsPerBlock);
-    LOG_DEVICE_PROP(maxThreadsPerMultiProcessor);
-
     unsigned i, j;
     unsigned partial_buf_entry_sz = WARP_MULTIPLE(fsets_dims[n]);
     unsigned fsets_buf_sz = 0;
@@ -236,6 +235,8 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
                                     cudaMemcpyHostToDevice, helper_stream));
     CU_HANDLE_ERROR(cudaMemcpyAsync(b_indices_d, b_indices, sizeof(unsigned char[N]), cudaMemcpyHostToDevice, helper_stream));
     cudaStreamDestroy(helper_stream);
+    // TODO(sergey): Implement waiting for the copy finished event to synchronize each of streams.
+    cudaDeviceSynchronize();
 
     fsets_buf_offset = 0;
     a0_buf_offset = 0;
