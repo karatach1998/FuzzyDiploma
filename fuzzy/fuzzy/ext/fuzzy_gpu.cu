@@ -112,12 +112,6 @@ void reduce_kernel(const float* b0_buf, float* partial_b0, unsigned b_n, unsigne
             }
             __syncthreads();
         }
-        // if (attr_index == 0) {
-        //     float max = 0.f;
-        //     for (unsigned j = 0; j < 6; ++j) max = fmaxf(max, b0_buf_cache[i + j * warp_multiple_dim]);
-        //     // b0_cache[i] = fminf(b0_cache[i], b0_buf_cache[i]);
-        //     b0_cache[i] = fminf(b0_cache[i], max);
-        // }
         if (attr_index == 0) {
             b0_cache[i] = fminf(b0_cache[i], b0_buf_cache[i]);
         }
@@ -152,25 +146,18 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
     /*
      * GPU global memory layout:
      * +-----------------------------------+
-     * | [META] Fuzzy sets lens + dims     |
-     * +-----------------------------------+
-     * | Fuzzy sets table (Ptrs to buffer) |
-     * +-----------------------------------+
      * | Fuzzy sets buffer (data store)    |
      * +-----------------------------------+
-     * | a0 table (Ptrs to buffer)         |
+     * | a0 buffer (data store)            |
      * +-----------------------------------+
-     * | a0 (data store)                   |
+     * | a (F-sets attr table indices)     |
      * +-----------------------------------+
-     * | a (indices in the F-sets table)   |
+     * | b (F-sets attr table indices)     |
      * +-----------------------------------+
-     * | b (indices in the F-sets table)   |
-     * +-----------------------------------+
-     * | Partial computs buffer (ftp | b0) |
-     * | and final result  b0 (data store) |
+     * | Partial b0 computations buffer    |
      * +-----------------------------------+
      *
-     * NOTE: N-th F-sets table entry corresponds to b's underling attribute.
+     * NOTE: n-th F-sets table entry corresponds to b's underling attribute.
      * NOTE: Everywhere below '*_table' varialbe name means array of pointers.
      */
 
@@ -241,14 +228,16 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
     fsets_buf_offset = 0;
     a0_buf_offset = 0;
     for (i = 0; i < n; ++i) {
-        fsets_buf_d_table[i] = fsets_buf_d + fsets_buf_offset;
-        CU_HANDLE_ERROR(cudaMemcpyAsync(fsets_buf_d_table[i], fsets_buf_pl_table[i], sizeof(float[fsets_lens[i] * fsets_dims[i]]), cudaMemcpyHostToDevice, streams[i]));
-        a0_buf_d_table[i] = a0_buf_d + a0_buf_offset;
-        CU_HANDLE_ERROR(cudaMemcpyAsync(a0_buf_d_table[i], a0_buf_pl_table[i], sizeof(float[fsets_dims[i]]), cudaMemcpyHostToDevice, streams[i]));
-        CU_HANDLE_ERROR(cudaMemcpyAsync(a_indices_d + i * N, a_indices_pl + i * N, sizeof(unsigned char[N]), cudaMemcpyHostToDevice, streams[i]));
+        {
+            fsets_buf_d_table[i] = fsets_buf_d + fsets_buf_offset;
+            CU_HANDLE_ERROR(cudaMemcpyAsync(fsets_buf_d_table[i], fsets_buf_pl_table[i], sizeof(float[fsets_lens[i] * fsets_dims[i]]), cudaMemcpyHostToDevice, streams[i]));
+            a0_buf_d_table[i] = a0_buf_d + a0_buf_offset;
+            CU_HANDLE_ERROR(cudaMemcpyAsync(a0_buf_d_table[i], a0_buf_pl_table[i], sizeof(float[fsets_dims[i]]), cudaMemcpyHostToDevice, streams[i]));
+            CU_HANDLE_ERROR(cudaMemcpyAsync(a_indices_d + i * N, a_indices_pl + i * N, sizeof(unsigned char[N]), cudaMemcpyHostToDevice, streams[i]));
 
-        fsets_buf_offset += fsets_lens[i] * fsets_dims[i];
-        a0_buf_offset += fsets_dims[i];
+            fsets_buf_offset += fsets_lens[i] * fsets_dims[i];
+            a0_buf_offset += fsets_dims[i];
+        }
 
         {
             unsigned min_blocks_per_sm = prop.maxThreadsPerMultiProcessor / prop.maxThreadsPerBlock;
@@ -289,26 +278,13 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
 
     float partial_b0[partial_b0_len][partial_b0_entry_sz];
     cudaMemcpy(partial_b0, partial_b0_d, sizeof(float[partial_b0_len][partial_b0_entry_sz]), cudaMemcpyDeviceToHost);
-    // float partial_b0[N * n][partial_b0_entry_sz];
-    // cudaMemcpy(partial_b0, partial_buf_d, sizeof(float[N * n][partial_buf_entry_sz]), cudaMemcpyDeviceToHost);
 
     memcpy(b0, partial_b0, sizeof(float[fsets_dims[n]]));
     for (i = 1; i < partial_b0_len; ++i) {
         for (j = 0; j < fsets_dims[n]; ++j) {
-            // b0[j] = MIN(b0[j], partial_b0[i][j]);
             if (partial_b0[i][j] < b0[j]) b0[j] = partial_b0[i][j];
         }
     }
-
-    // float b0_tmp[21];
-    // for (j = 0; j < fsets_dims[n]; ++j) b0[j] = 1.f;
-    // for (k = 0; k < N; ++k) {
-    //     memset(b0_tmp, 0, sizeof(b0_tmp));
-    //     for (i = 0; i < n; ++i) {
-    //         for (j = 0; j < fsets_dims[n]; ++j) b0_tmp[j] = MAX(b0_tmp[j], partial_b0[i + k * n][j]);
-    //     }
-    //     for (j = 0; j < fsets_dims[n]; ++j) b0[j] = MIN(b0[j], b0_tmp[j]);
-    // }
 
     cudaFree(fsets_buf_d);
     cudaFree(a0_buf_d);
