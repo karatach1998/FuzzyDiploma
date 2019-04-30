@@ -90,8 +90,8 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
 __global__
 void reduce_kernel(const float* b0_buf, float* partial_b0, unsigned b_n, unsigned N, unsigned n)
 {
-    unsigned buf_entry_sz = WARP_MULTIPLE(MAX(T_NUM, b_n));
-    unsigned warp_multiple_dim = WARP_MULTIPLE(b_n); // same as (blockDim.x / n)
+    unsigned buf_entry_sz = WARP_MULTIPLE(b_n);
+    unsigned warp_multiple_dim = WARP_MULTIPLE(b_n);
     unsigned i = threadIdx.x % warp_multiple_dim;
     unsigned attr_index = threadIdx.x / warp_multiple_dim;
     unsigned k = blockIdx.x;
@@ -115,9 +115,6 @@ void reduce_kernel(const float* b0_buf, float* partial_b0, unsigned b_n, unsigne
         if (attr_index == 0) {
             b0_cache[i] = fminf(b0_cache[i], b0_buf_cache[i]);
         }
-        // NOTE(sergey): So we skip synchronization in this point of loop,
-        // because for debug purpose we thoughtlessly assume that 0 <= i < 32
-        // and therefore will be executed by single warp.
         k += gridDim.x;
     }
     // NOTE(sergey): Make sure that b0_buf and partial_b0 don't overlap.
@@ -213,21 +210,23 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
     CU_HANDLE_ERROR(cudaMalloc(&partial_buf_d, sizeof(float[N * n][partial_buf_entry_sz])));
 
     cudaStream_t streams[n], helper_stream;
+    cudaEvent_t common_data_copied_event;
 
     CU_HANDLE_ERROR(cudaStreamCreate(&helper_stream));
     for (i = 0; i < n; ++i) CU_HANDLE_ERROR(cudaStreamCreate(streams + i));
-
+    cudaEventCreate(&common_data_copied_event);
+    
     float* fsets_b_d = fsets_buf_d + fsets_buf_sz - fsets_lens[n] * fsets_dims[n];
     CU_HANDLE_ERROR(cudaMemcpyAsync(fsets_b_d, fsets_buf_pl_table[n], sizeof(float[fsets_lens[n] * fsets_dims[n]]),
                                     cudaMemcpyHostToDevice, helper_stream));
     CU_HANDLE_ERROR(cudaMemcpyAsync(b_indices_d, b_indices, sizeof(unsigned char[N]), cudaMemcpyHostToDevice, helper_stream));
+    cudaEventRecord(common_data_copied_event, helper_stream);
     cudaStreamDestroy(helper_stream);
-    // TODO(sergey): Implement waiting for the copy finished event to synchronize each of streams.
-    cudaDeviceSynchronize();
 
     fsets_buf_offset = 0;
     a0_buf_offset = 0;
     for (i = 0; i < n; ++i) {
+        cudaStreamWaitEvent(streams[i], common_data_copied_event, 0);
         {
             fsets_buf_d_table[i] = fsets_buf_d + fsets_buf_offset;
             CU_HANDLE_ERROR(cudaMemcpyAsync(fsets_buf_d_table[i], fsets_buf_pl_table[i], sizeof(float[fsets_lens[i] * fsets_dims[i]]), cudaMemcpyHostToDevice, streams[i]));
