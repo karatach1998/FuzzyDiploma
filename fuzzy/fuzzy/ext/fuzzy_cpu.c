@@ -23,7 +23,7 @@ void predict_cpu(const float** fsets_table[], const unsigned* fsets_lens, const 
     // - both a, b are cache-line aligned.
 
     unsigned i, j, k, ti;
-    float ftp[T_NUM], b0_row[fsets_dims[n]];
+    float ftp[T_DIM], b0_row[fsets_dims[n]];
 
     for (j = 0; j < fsets_dims[n]; ++j) b0[j] = 1.f;
     for (k = 0; k < N; ++k) {
@@ -36,14 +36,14 @@ void predict_cpu(const float** fsets_table[], const unsigned* fsets_lens, const 
 
             // Compute fuzzy truth power
             memset(ftp, 0, sizeof(ftp));
-            for (ti = 0; ti < T_NUM; ++ti) {
-                float t = (float) ti / (T_NUM - 1);
+            for (ti = 0; ti < T_DIM; ++ti) {
+                float t = (float) ti / (T_DIM - 1);
 
-                for (j = 0; j < fsets_dims[i] - 1; ++j) {
+                for (j = 0; j < fsets_dims[i]; ++j) {
                     float a1 = a[j];
                     float a2 = a[j + 1];
 
-                    if ((t - a1) * (a2 - t) >= 0) {
+                    if (a1 <= t && t <= a2) {
                         // float x = x1 + (t - a1) * (x2 - x1) / (a2 - a1);
                         // float y = a0[j] + (x - x1) * (a0[j + 1] - a0[j]) / (x2 - x1);
                         float y = a0i[j] + (t - a1) * (a0i[j + 1] - a0i[j]) / (a2 - a1);
@@ -56,7 +56,7 @@ void predict_cpu(const float** fsets_table[], const unsigned* fsets_lens, const 
             // Compute t-norm reduction
             for (j = 0; j < fsets_dims[n]; ++j) {
                 float max = 0.f;
-                for (ti = 0; ti < T_NUM; ++ti) max = MAX(max, MIN(ftp[ti], IMPL((float) ti / (T_NUM - 1), b[j])));
+                for (ti = 0; ti < T_DIM; ++ti) max = MAX(max, MIN(ftp[ti], IMPL((float) ti / (T_DIM - 1), b[j])));
                 b0_row[j] = MAX(b0_row[j], max);
             }
         }

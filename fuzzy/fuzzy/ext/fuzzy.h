@@ -1,7 +1,7 @@
 #ifndef FUZZY_H
 #define FUZZY_H
 
-#define T_NUM 11
+#define T_DIM 11
 
 #ifdef __cplusplus
 extern "C" {

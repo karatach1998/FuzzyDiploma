@@ -1,5 +1,3 @@
-#define T_NUM 11
-
         .data
 .LCPI0_0:
         .long   1065353216              # float 1
