@@ -2,7 +2,6 @@
 #include "fuzzy.h"
 
 #define CACHE_LINE_SIZE 128
-#define T_NUM 11
 #define IMPL(a, b) (1 - (a) + (b))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -33,18 +32,18 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
 {
     unsigned i, j, k;
     unsigned buf_entry_sz = WARP_MULTIPLE(b_n);
-    unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_NUM, b_n));
+    unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_DIM, b_n));
     unsigned executor_per_block = blockDim.x / warp_multiple_dim;
     unsigned executor_index = threadIdx.x / warp_multiple_dim;
     unsigned tid = threadIdx.x % warp_multiple_dim;
 
     extern __shared__ float cache[];
 
-    float* ftp = cache + executor_index * (WARP_MULTIPLE(T_NUM) + WARP_MULTIPLE(b_n));
-    float* b0 = cache + executor_index * (WARP_MULTIPLE(T_NUM) + WARP_MULTIPLE(b_n)) + WARP_MULTIPLE(T_NUM);
+    float* ftp = cache + executor_index * (WARP_MULTIPLE(T_DIM) + WARP_MULTIPLE(b_n));
+    float* b0 = cache + executor_index * (WARP_MULTIPLE(T_DIM) + WARP_MULTIPLE(b_n)) + WARP_MULTIPLE(T_DIM);
     
     unsigned ti = tid;
-    const float t = (float) ti / (T_NUM - 1);
+    const float t = (float) ti / (T_DIM - 1);
 
     for (k = blockIdx.x * executor_per_block + executor_index; k < N; k += gridDim.x * executor_per_block) {
 
@@ -54,7 +53,7 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
         // due to if condition. It guards from overhead when computing with unified block size
         // (maximum from ftp and b0 buffer sizes).
 
-        if (tid < WARP_MULTIPLE(T_NUM)) {
+        if (tid < WARP_MULTIPLE(T_DIM)) {
             const float* __restrict__ a = a_fsets + a_indices[k] * a_n;
             const unsigned ti = tid;
 
@@ -77,8 +76,8 @@ void compute_kernel(const float* __restrict__ a_fsets, const float* __restrict__
 
             b0[tid] = 0.f;
 #pragma unroll
-            for (ti = 0; ti < T_NUM; ++ti) {
-                float impl = IMPL((float)ti / (T_NUM - 1), b[tid]);
+            for (ti = 0; ti < T_DIM; ++ti) {
+                float impl = IMPL((float)ti / (T_DIM - 1), b[tid]);
                 float min = fminf(ftp[ti], impl);
                 if (min > b0[tid]) b0[tid] = min;
             }
@@ -176,10 +175,10 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
     unsigned char *a_indices_pl, *b_indices_pl;
     unsigned fsets_buf_offset, a0_buf_offset;
 
-    CU_HANDLE_ERROR(cudaHostAlloc(&fsets_buf_pl, sizeof(float[fsets_buf_sz]), cudaHostAllocPortable | cudaHostAllocWriteCombined));
-    CU_HANDLE_ERROR(cudaHostAlloc(&a0_buf_pl, sizeof(float[a0_buf_sz]), cudaHostAllocPortable | cudaHostAllocWriteCombined));
-    CU_HANDLE_ERROR(cudaHostAlloc(&a_indices_pl, sizeof(unsigned char[N * n]), cudaHostAllocPortable | cudaHostAllocWriteCombined));
-    CU_HANDLE_ERROR(cudaHostAlloc(&b_indices_pl, sizeof(unsigned char[N]), cudaHostAllocPortable | cudaHostAllocWriteCombined));
+    CU_HANDLE_ERROR(cudaHostAlloc(&fsets_buf_pl, sizeof(float[fsets_buf_sz]), cudaHostAllocWriteCombined));
+    CU_HANDLE_ERROR(cudaHostAlloc(&a0_buf_pl, sizeof(float[a0_buf_sz]), cudaHostAllocWriteCombined));
+    CU_HANDLE_ERROR(cudaHostAlloc(&a_indices_pl, sizeof(unsigned char[N * n]), cudaHostAllocWriteCombined));
+    CU_HANDLE_ERROR(cudaHostAlloc(&b_indices_pl, sizeof(unsigned char[N]), cudaHostAllocWriteCombined));
 
     fsets_buf_offset = 0;
     for (i = 0; i < n + 1; ++i) {
@@ -209,19 +208,19 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
     CU_HANDLE_ERROR(cudaMalloc(&b_indices_d, sizeof(unsigned char[N])));
     CU_HANDLE_ERROR(cudaMalloc(&partial_buf_d, sizeof(float[N * n][partial_buf_entry_sz])));
 
-    cudaStream_t streams[n], helper_stream;
+    cudaStream_t streams[n], common_stream;
     cudaEvent_t common_data_copied_event;
 
-    CU_HANDLE_ERROR(cudaStreamCreate(&helper_stream));
+    CU_HANDLE_ERROR(cudaStreamCreate(&common_stream));
     for (i = 0; i < n; ++i) CU_HANDLE_ERROR(cudaStreamCreate(streams + i));
     cudaEventCreate(&common_data_copied_event);
     
     float* fsets_b_d = fsets_buf_d + fsets_buf_sz - fsets_lens[n] * fsets_dims[n];
     CU_HANDLE_ERROR(cudaMemcpyAsync(fsets_b_d, fsets_buf_pl_table[n], sizeof(float[fsets_lens[n] * fsets_dims[n]]),
-                                    cudaMemcpyHostToDevice, helper_stream));
-    CU_HANDLE_ERROR(cudaMemcpyAsync(b_indices_d, b_indices, sizeof(unsigned char[N]), cudaMemcpyHostToDevice, helper_stream));
-    cudaEventRecord(common_data_copied_event, helper_stream);
-    cudaStreamDestroy(helper_stream);
+                                    cudaMemcpyHostToDevice, common_stream));
+    CU_HANDLE_ERROR(cudaMemcpyAsync(b_indices_d, b_indices, sizeof(unsigned char[N]), cudaMemcpyHostToDevice, common_stream));
+    cudaEventRecord(common_data_copied_event, common_stream);
+    cudaStreamDestroy(common_stream);
 
     fsets_buf_offset = 0;
     a0_buf_offset = 0;
@@ -239,14 +238,14 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
         }
 
         {
-            unsigned min_blocks_per_sm = prop.maxThreadsPerMultiProcessor / prop.maxThreadsPerBlock;
+            unsigned min_blocks_per_sm = prop.maxThreadsPerMultiProcessor / prop.maxThreadsPerBlock; // needed to achieve maximum occupancy
             unsigned blocks = prop.multiProcessorCount * min_blocks_per_sm;
             // NOTE(sergey): To achieve better performance we probably need to perform computation for more than one rule inside one block.
             // So we use several executors per block.
-            unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_NUM, fsets_dims[n]));
+            unsigned warp_multiple_dim = WARP_MULTIPLE(MAX(T_DIM, fsets_dims[n]));
             unsigned executor_per_block = prop.maxThreadsPerBlock / warp_multiple_dim;
             unsigned threads = executor_per_block * warp_multiple_dim;
-            unsigned shared_sz = sizeof(float[executor_per_block][/* ftp */ WARP_MULTIPLE(T_NUM) + /* b0 */ WARP_MULTIPLE(fsets_dims[n])]);
+            unsigned shared_sz = sizeof(float[executor_per_block][/* ftp */ WARP_MULTIPLE(T_DIM) + /* b0 */ WARP_MULTIPLE(fsets_dims[n])]);
             compute_kernel<<<blocks, threads, shared_sz, streams[i]>>>(fsets_buf_d_table[i], fsets_b_d, a0_buf_d_table[i], a_indices_d + i * N, b_indices_d, partial_buf_d,
                                                                        i, fsets_lens[i], fsets_dims[i], fsets_lens[n], fsets_dims[n], N, n);
             CU_HANDLE_ERROR(cudaPeekAtLastError());
@@ -256,6 +255,16 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
     for (i = 0; i < n; ++i) cudaStreamDestroy(streams[i]);
     cudaDeviceSynchronize();
     CU_HANDLE_ERROR(cudaPeekAtLastError());
+
+    cudaFree(fsets_buf_d);
+    cudaFree(a0_buf_d);
+    cudaFree(a_indices_d);
+    cudaFree(b_indices_d);
+
+    cudaFreeHost(fsets_buf_pl);
+    cudaFreeHost(a0_buf_pl);
+    cudaFreeHost(a_indices_pl);
+    cudaFreeHost(b_indices_pl);
 
     float* partial_b0_d;
     unsigned partial_b0_len, partial_b0_entry_sz;
@@ -285,15 +294,6 @@ void predict_gpu(const float** fsets[], const unsigned* fsets_lens, const unsign
         }
     }
 
-    cudaFree(fsets_buf_d);
-    cudaFree(a0_buf_d);
-    cudaFree(a_indices_d);
-    cudaFree(b_indices_d);
     cudaFree(partial_buf_d);
     cudaFree(partial_b0_d);
-
-    cudaFreeHost(fsets_buf_pl);
-    cudaFreeHost(a0_buf_pl);
-    cudaFreeHost(a_indices_pl);
-    cudaFreeHost(b_indices_pl);
 }
