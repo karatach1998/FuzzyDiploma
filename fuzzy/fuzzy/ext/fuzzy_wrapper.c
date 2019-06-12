@@ -31,13 +31,6 @@ PyMODINIT_FUNC PyInit_fuzzy_ext(void)
     return PyModule_Create(&fuzzy_module);
 }
 
-#define PRINT_DEBUG \
-    { \
-        FILE* f = fopen("tmp.txt", "w"); \
-        fputs("Hello from fuzzy extension!\n", f); \
-        fclose(f); \
-    }
-
 
 static PyObject* predict_cpu_wrapper(PyObject* dummy, PyObject* args)
 {
@@ -49,7 +42,7 @@ static PyObject* predict_cpu_wrapper(PyObject* dummy, PyObject* args)
     }
 
     Py_ssize_t fsets_len = PyList_Size(fsets_obj);
-    npy_intp* a0_dims = PyArray_DIMS(a0_obj);
+    Py_ssize_t a0_len = PyList_Size(a0_obj);
     npy_intp* a_dims = PyArray_DIMS(a_obj);
     npy_intp* b_dims = PyArray_DIMS(b_obj);
 
@@ -86,7 +79,8 @@ static PyObject* predict_cpu_wrapper(PyObject* dummy, PyObject* args)
     float b0[fsets_dims[n]];
 
     for (i = 0; i < n; ++i) {
-        a0[i] = PyArray_GETPTR1(a0_obj, i);
+        PyArrayObject* fset_obj = (PyArrayObject*) PyList_GET_ITEM(a0_obj, i);
+        a0[i] = PyArray_DATA(fset_obj);
         a[i] = PyArray_GETPTR1(a_obj, i);
     }
 
@@ -109,7 +103,7 @@ static PyObject* predict_gpu_wrapper(PyObject* dummy, PyObject* args)
 
     /* Check dims */
     Py_ssize_t fsets_len = PyList_Size(fsets_obj);
-    npy_intp* a0_dims = PyArray_DIMS(a0_obj); // len == 1
+    Py_ssize_t a0_len = PyList_Size(a0_obj); // len == 1
     npy_intp* a_dims = PyArray_DIMS(a_obj); // len == 2
     npy_intp* b_dims = PyArray_DIMS(b_obj); // len == 1
 
@@ -144,18 +138,19 @@ static PyObject* predict_gpu_wrapper(PyObject* dummy, PyObject* args)
     const float* a0[n];
     const unsigned char* a[n];
     const unsigned char* b = PyArray_DATA(b_obj);
-    float b0[n+1][fsets_dims[n]];
+    float b0[fsets_dims[n]];
 
     for (i = 0; i < n; ++i) {
-        a0[i] = PyArray_GETPTR1(a0_obj, i);
+        PyArrayObject* fset_obj = (PyArrayObject*) PyList_GET_ITEM(a0_obj, i);
+        a0[i] = PyArray_DATA(fset_obj);
         a[i] = PyArray_GETPTR1(a_obj, i);
     }
-
+    
     predict_gpu(fsets_table, fsets_lens, fsets_dims, a0, a, b, b0, N, n);
 
-    npy_intp b0_dims[2] = { 7, fsets_dims[n] };
-    PyObject* b0_obj = PyArray_SimpleNew(2, b0_dims, NPY_FLOAT32);
+    npy_intp b0_dims[1] = { fsets_dims[n] };
+    PyObject* b0_obj = PyArray_SimpleNew(1, b0_dims, NPY_FLOAT32);
 
-    memcpy(PyArray_DATA(b0_obj), b0, sizeof(float[n+1][fsets_dims[n]]));
+    memcpy(PyArray_DATA(b0_obj), b0, sizeof(float[fsets_dims[n]]));
     return b0_obj;
 }
