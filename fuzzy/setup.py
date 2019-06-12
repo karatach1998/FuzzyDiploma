@@ -18,7 +18,7 @@ ext_module = Extension('fuzzy_ext',
                        sources=[join(PACKAGE_DIR, 'ext', file) for file in ['fuzzy_wrapper.c', 'fuzzy_cpu.c', 'fuzzy_cpu_asm.S', 'fuzzy_gpu.cu']],
                        extra_compile_args={
                              'gcc': ['-O3'],
-                             'nvcc': '-c -Xcompiler -fPIC,-g,-O0'.split()},
+                             'nvcc': '-c -maxrregcount 32 -arch=sm_35 -Xptxas -O3,-v -Xcompiler -fPIC,-O0'.split()},
                        extra_link_args=['-lstdc++', '-L/usr/local/cuda/lib64', '-lcudart'])
 
 def customize_compiler_for_cuda(compiler):
@@ -47,7 +47,7 @@ class CustomBuildExt(build_ext):
 setup(name='fuzzy',
       version='1.0',
       description='',
-      package=['fuzzy'],
+      packages=['fuzzy'],
       ext_modules=[ext_module],
       package_dir={'fuzzy': PACKAGE_DIR},
       cmdclass={'build_ext': CustomBuildExt})
